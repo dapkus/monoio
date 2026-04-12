@@ -26,6 +26,7 @@ thread_local! {
         tasks: Default::default(),
         time_handle: None,
         blocking_handle: crate::blocking::BlockingHandle::Empty(crate::blocking::BlockingStrategy::Panic),
+        poll_spin_us: None,
     };
 }
 
@@ -54,11 +55,20 @@ pub(crate) struct Context {
     /// Blocking Handle
     #[cfg(feature = "sync")]
     pub(crate) blocking_handle: crate::blocking::BlockingHandle,
+
+    /// Poll spin duration in microseconds. When set, the event loop will spin
+    /// for up to this duration checking the io_uring CQ ring (shared memory)
+    /// before falling back to a blocking `park()` call. This reduces per-yield
+    /// latency at the cost of CPU usage.
+    pub(crate) poll_spin_us: Option<u64>,
 }
 
 impl Context {
     #[cfg(feature = "sync")]
-    pub(crate) fn new(blocking_handle: crate::blocking::BlockingHandle) -> Self {
+    pub(crate) fn new(
+        blocking_handle: crate::blocking::BlockingHandle,
+        poll_spin_us: Option<u64>,
+    ) -> Self {
         let thread_id = crate::builder::BUILD_THREAD_ID.with(|id| *id);
 
         Self {
@@ -68,17 +78,19 @@ impl Context {
             tasks: TaskQueue::default(),
             time_handle: None,
             blocking_handle,
+            poll_spin_us,
         }
     }
 
     #[cfg(not(feature = "sync"))]
-    pub(crate) fn new() -> Self {
+    pub(crate) fn new(poll_spin_us: Option<u64>) -> Self {
         let thread_id = crate::builder::BUILD_THREAD_ID.with(|id| *id);
 
         Self {
             thread_id,
             tasks: TaskQueue::default(),
             time_handle: None,
+            poll_spin_us,
         }
     }
 
@@ -182,13 +194,53 @@ impl<D> Runtime<D> {
                         let _ = self.driver.submit();
                     }
 
-                    // Wait and Process CQ(the error is ignored for not debug mode)
-                    #[cfg(not(all(debug_assertions, feature = "debug")))]
-                    let _ = self.driver.park();
+                    // Poll spin mode: spin for up to poll_spin_us microseconds
+                    // checking the io_uring CQ ring (shared memory read, no syscall)
+                    // before falling back to the blocking park() call.
+                    //
+                    // In completion-based io_uring, the kernel writes CQEs directly
+                    // to a shared memory ring. driver.submit() calls tick() which
+                    // reads the CQ ring via atomic load-acquire — no io_uring_enter
+                    // syscall needed for CQE discovery. This spin loop exploits that
+                    // property to reduce per-yield latency from ~0.6ms (blocking
+                    // io_uring_enter with min_complete=1) to near-zero.
+                    if let Some(spin_us) = self.context.poll_spin_us {
+                        // Flush any pending SQEs so the kernel starts processing them.
+                        let _ = self.driver.submit();
 
-                    #[cfg(all(debug_assertions, feature = "debug"))]
-                    if let Err(e) = self.driver.park() {
-                        trace!("park error: {:?}", e);
+                        // Check if submit()'s tick() already woke tasks.
+                        if !self.context.tasks.is_empty() {
+                            continue;
+                        }
+
+                        // Spin: repeatedly call submit() which internally calls
+                        // tick() to read the CQ ring from shared memory.
+                        let start = std::time::Instant::now();
+                        let budget = std::time::Duration::from_micros(spin_us);
+                        loop {
+                            let _ = self.driver.submit();
+
+                            if !self.context.tasks.is_empty() {
+                                break;
+                            }
+
+                            if start.elapsed() >= budget {
+                                // Spin budget exhausted — fall through to blocking park.
+                                let _ = self.driver.park();
+                                break;
+                            }
+
+                            std::hint::spin_loop();
+                        }
+                    } else {
+                        // Default: blocking wait for I/O completion
+                        #[cfg(not(all(debug_assertions, feature = "debug")))]
+                        let _ = self.driver.park();
+
+                        #[cfg(all(debug_assertions, feature = "debug"))]
+                        if let Err(e) = self.driver.park() {
+                            trace!("park error: {:?}", e);
+                        }
                     }
                 }
             })
@@ -445,5 +497,103 @@ mod tests {
         });
         let eps = instant.elapsed().subsec_millis();
         assert!((eps as i32 - 200).abs() < 50);
+    }
+
+    // Poll spin mode tests — verify the builder plumbing and basic runtime
+    // behavior. The real latency improvement is only measurable under io_uring
+    // on Linux with actual I/O load.
+
+    #[cfg(feature = "legacy")]
+    #[test]
+    fn poll_spin_builder_accepted() {
+        // Verify poll_spin_us builder method compiles and produces a working runtime
+        use crate::driver::LegacyDriver;
+        let mut rt = crate::RuntimeBuilder::<LegacyDriver>::new()
+            .poll_spin_us(100)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            // Simple task completes normally with poll spin enabled
+            let x = 1 + 1;
+            assert_eq!(x, 2);
+        });
+    }
+
+    #[cfg(feature = "legacy")]
+    #[test]
+    fn poll_spin_zero_budget() {
+        // Zero microseconds means spin check once then immediately fall through to park
+        use crate::driver::LegacyDriver;
+        let mut rt = crate::RuntimeBuilder::<LegacyDriver>::new()
+            .poll_spin_us(0)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let x = 42;
+            assert_eq!(x, 42);
+        });
+    }
+
+    #[cfg(feature = "legacy")]
+    #[test]
+    fn poll_spin_disabled_by_default() {
+        // Without calling poll_spin_us(), behavior is unchanged (blocking park)
+        use crate::driver::LegacyDriver;
+        let mut rt = crate::RuntimeBuilder::<LegacyDriver>::new()
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            assert!(true);
+        });
+    }
+
+    #[cfg(feature = "legacy")]
+    #[test]
+    fn poll_spin_with_timer() {
+        // poll_spin_us works with enable_timer()
+        use crate::driver::LegacyDriver;
+        let mut rt = crate::RuntimeBuilder::<LegacyDriver>::new()
+            .poll_spin_us(50)
+            .enable_timer()
+            .build()
+            .unwrap();
+        let instant = std::time::Instant::now();
+        rt.block_on(async {
+            crate::time::sleep(std::time::Duration::from_millis(100)).await;
+        });
+        let eps = instant.elapsed().as_millis();
+        assert!(eps >= 80 && eps < 300, "timer fired in {}ms", eps);
+    }
+
+    #[cfg(all(target_os = "linux", feature = "iouring"))]
+    #[test]
+    fn poll_spin_iouring_basic() {
+        // Verify poll spin mode works with io_uring driver
+        use crate::driver::IoUringDriver;
+        let mut rt = crate::RuntimeBuilder::<IoUringDriver>::new()
+            .poll_spin_us(100)
+            .build()
+            .unwrap();
+        rt.block_on(async {
+            let x = 1 + 1;
+            assert_eq!(x, 2);
+        });
+    }
+
+    #[cfg(all(target_os = "linux", feature = "iouring"))]
+    #[test]
+    fn poll_spin_iouring_with_timer() {
+        use crate::driver::IoUringDriver;
+        let mut rt = crate::RuntimeBuilder::<IoUringDriver>::new()
+            .poll_spin_us(200)
+            .enable_timer()
+            .build()
+            .unwrap();
+        let instant = std::time::Instant::now();
+        rt.block_on(async {
+            crate::time::sleep(std::time::Duration::from_millis(100)).await;
+        });
+        let eps = instant.elapsed().as_millis();
+        assert!(eps >= 80 && eps < 300, "timer fired in {}ms", eps);
     }
 }

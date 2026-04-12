@@ -25,6 +25,10 @@ pub struct RuntimeBuilder<D> {
     // blocking handle
     #[cfg(feature = "sync")]
     blocking_handle: crate::blocking::BlockingHandle,
+
+    // Poll spin duration in microseconds
+    poll_spin_us: Option<u64>,
+
     // driver mark
     _mark: PhantomData<D>,
 }
@@ -51,6 +55,7 @@ impl<T> RuntimeBuilder<T> {
 
             #[cfg(feature = "sync")]
             blocking_handle: crate::blocking::BlockingStrategy::Panic.into(),
+            poll_spin_us: None,
             _mark: PhantomData,
         }
     }
@@ -93,6 +98,7 @@ impl Buildable for LegacyDriver {
         let thread_id = gen_id();
         #[cfg(feature = "sync")]
         let blocking_handle = this.blocking_handle;
+        let poll_spin_us = this.poll_spin_us;
 
         BUILD_THREAD_ID.set(&thread_id, || {
             let driver = match this.entries {
@@ -100,9 +106,9 @@ impl Buildable for LegacyDriver {
                 None => LegacyDriver::new()?,
             };
             #[cfg(feature = "sync")]
-            let context = crate::runtime::Context::new(blocking_handle);
+            let context = crate::runtime::Context::new(blocking_handle, poll_spin_us);
             #[cfg(not(feature = "sync"))]
-            let context = crate::runtime::Context::new();
+            let context = crate::runtime::Context::new(poll_spin_us);
             Ok(Runtime::new(context, driver))
         })
     }
@@ -114,6 +120,7 @@ impl Buildable for IoUringDriver {
         let thread_id = gen_id();
         #[cfg(feature = "sync")]
         let blocking_handle = this.blocking_handle;
+        let poll_spin_us = this.poll_spin_us;
 
         BUILD_THREAD_ID.set(&thread_id, || {
             let driver = match this.entries {
@@ -121,15 +128,29 @@ impl Buildable for IoUringDriver {
                 None => IoUringDriver::new(&this.urb)?,
             };
             #[cfg(feature = "sync")]
-            let context = crate::runtime::Context::new(blocking_handle);
+            let context = crate::runtime::Context::new(blocking_handle, poll_spin_us);
             #[cfg(not(feature = "sync"))]
-            let context = crate::runtime::Context::new();
+            let context = crate::runtime::Context::new(poll_spin_us);
             Ok(Runtime::new(context, driver))
         })
     }
 }
 
 impl<D> RuntimeBuilder<D> {
+    /// Enable poll spin mode. The event loop will spin for up to `spin_us`
+    /// microseconds checking the io_uring CQ ring (shared memory, no syscall)
+    /// before falling back to a blocking `park()` call.
+    ///
+    /// This reduces per-yield latency at the cost of CPU usage. The event loop
+    /// burns CPU during the spin window even when no completions arrive.
+    ///
+    /// Default: `None` (disabled — standard blocking mode).
+    #[must_use]
+    pub fn poll_spin_us(mut self, spin_us: u64) -> Self {
+        self.poll_spin_us = Some(spin_us);
+        self
+    }
+
     const MIN_ENTRIES: u32 = 256;
 
     /// Set io_uring entries, min size is 256 and the default size is 1024.
@@ -174,6 +195,7 @@ impl RuntimeBuilder<FusionDriver> {
                 urb: self.urb,
                 #[cfg(feature = "sync")]
                 blocking_handle: self.blocking_handle,
+                poll_spin_us: self.poll_spin_us,
                 _mark: PhantomData,
             };
             info!("io_uring driver built");
@@ -184,6 +206,7 @@ impl RuntimeBuilder<FusionDriver> {
                 urb: self.urb,
                 #[cfg(feature = "sync")]
                 blocking_handle: self.blocking_handle,
+                poll_spin_us: self.poll_spin_us,
                 _mark: PhantomData,
             };
             info!("legacy driver built");
@@ -198,6 +221,7 @@ impl RuntimeBuilder<FusionDriver> {
             entries: self.entries,
             #[cfg(feature = "sync")]
             blocking_handle: self.blocking_handle,
+            poll_spin_us: self.poll_spin_us,
             _mark: PhantomData,
         };
         Ok(builder.build()?.into())
@@ -211,6 +235,7 @@ impl RuntimeBuilder<FusionDriver> {
             urb: self.urb,
             #[cfg(feature = "sync")]
             blocking_handle: self.blocking_handle,
+            poll_spin_us: self.poll_spin_us,
             _mark: PhantomData,
         };
         Ok(builder.build()?.into())
@@ -230,6 +255,7 @@ impl RuntimeBuilder<TimeDriver<FusionDriver>> {
                 urb: self.urb,
                 #[cfg(feature = "sync")]
                 blocking_handle: self.blocking_handle,
+                poll_spin_us: self.poll_spin_us,
                 _mark: PhantomData,
             };
             info!("io_uring driver with timer built");
@@ -240,6 +266,7 @@ impl RuntimeBuilder<TimeDriver<FusionDriver>> {
                 urb: self.urb,
                 #[cfg(feature = "sync")]
                 blocking_handle: self.blocking_handle,
+                poll_spin_us: self.poll_spin_us,
                 _mark: PhantomData,
             };
             info!("legacy driver with timer built");
@@ -254,6 +281,7 @@ impl RuntimeBuilder<TimeDriver<FusionDriver>> {
             entries: self.entries,
             #[cfg(feature = "sync")]
             blocking_handle: self.blocking_handle,
+            poll_spin_us: self.poll_spin_us,
             _mark: PhantomData,
         };
         Ok(builder.build()?.into())
@@ -267,6 +295,7 @@ impl RuntimeBuilder<TimeDriver<FusionDriver>> {
             urb: self.urb,
             #[cfg(feature = "sync")]
             blocking_handle: self.blocking_handle,
+            poll_spin_us: self.poll_spin_us,
             _mark: PhantomData,
         };
         Ok(builder.build()?.into())
@@ -300,6 +329,7 @@ where
             urb: this.urb,
             #[cfg(feature = "sync")]
             blocking_handle: this.blocking_handle,
+            poll_spin_us: this.poll_spin_us,
             _mark: PhantomData,
         })?;
 
@@ -328,6 +358,7 @@ impl<D: time_wrap::TimeWrapable> RuntimeBuilder<D> {
             urb,
             #[cfg(feature = "sync")]
             blocking_handle,
+            poll_spin_us,
             ..
         } = self;
         RuntimeBuilder {
@@ -336,6 +367,7 @@ impl<D: time_wrap::TimeWrapable> RuntimeBuilder<D> {
             urb,
             #[cfg(feature = "sync")]
             blocking_handle,
+            poll_spin_us,
             _mark: PhantomData,
         }
     }
