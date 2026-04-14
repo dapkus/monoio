@@ -267,54 +267,47 @@ impl IoUringDriver {
                 // Submit pending SQEs without blocking (min_complete=0).
                 inner.submit()?;
 
-                // Check if completions are already available.
-                inner.tick()?;
-                if inner.ops.slab.len() == 0 {
-                    // No in-flight ops, no point spinning.
-                } else {
-                    // Check if tick() found any completions by peeking the CQ.
-                    // The CQ is already consumed by tick() above, so we need
-                    // to spin: repeatedly peek the CQ ring until completions
-                    // arrive or the spin budget expires.
-                    let budget = Duration::from_micros(spin_us);
-                    let start = std::time::Instant::now();
-                    loop {
-                        // Peek the CQ ring — pure shared-memory read, no syscall.
-                        let cq = inner.uring.completion();
-                        let mut found = false;
-                        for cqe in cq {
-                            found = true;
-                            let index = cqe.user_data();
-                            match index {
-                                #[cfg(feature = "sync")]
-                                EVENTFD_USERDATA => inner.eventfd_installed = false,
-                                #[cfg(feature = "poll-io")]
-                                POLLER_USERDATA => {
-                                    inner.poller_installed = false;
-                                    inner.poll.tick(Some(Duration::ZERO))?;
-                                }
-                                _ if index >= MIN_REVERSED_USERDATA => (),
-                                _ => unsafe {
-                                    inner
-                                        .ops
-                                        .complete(index as _, resultify(&cqe), cqe.flags())
-                                },
-                            }
-                        }
-                        if found {
-                            // Completions processed, no need to block.
+                // Spin-poll the CQ ring. We process completions inline
+                // (same logic as tick()) to detect when work is ready.
+                let budget = Duration::from_micros(spin_us);
+                let start = std::time::Instant::now();
+                loop {
+                    // Peek the CQ ring — pure shared-memory read, no syscall.
+                    let cq = inner.uring.completion();
+                    let mut found = false;
+                    for cqe in cq {
+                        found = true;
+                        let index = cqe.user_data();
+                        match index {
                             #[cfg(feature = "sync")]
-                            inner
-                                .shared_waker
-                                .awake
-                                .store(true, std::sync::atomic::Ordering::Release);
-                            return Ok(());
+                            EVENTFD_USERDATA => inner.eventfd_installed = false,
+                            #[cfg(feature = "poll-io")]
+                            POLLER_USERDATA => {
+                                inner.poller_installed = false;
+                                inner.poll.tick(Some(Duration::ZERO))?;
+                            }
+                            _ if index >= MIN_REVERSED_USERDATA => (),
+                            _ => unsafe {
+                                inner
+                                    .ops
+                                    .complete(index as _, resultify(&cqe), cqe.flags())
+                            },
                         }
-                        if start.elapsed() >= budget {
-                            break; // Spin budget exhausted, fall through to blocking.
-                        }
-                        std::hint::spin_loop();
                     }
+                    if found {
+                        // Completions processed — return immediately so the
+                        // executor can run newly-woken tasks.
+                        #[cfg(feature = "sync")]
+                        inner
+                            .shared_waker
+                            .awake
+                            .store(true, std::sync::atomic::Ordering::Release);
+                        return Ok(());
+                    }
+                    if start.elapsed() >= budget {
+                        break; // Spin budget exhausted, fall through to blocking.
+                    }
+                    std::hint::spin_loop();
                 }
             }
 
