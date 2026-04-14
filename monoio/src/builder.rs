@@ -25,6 +25,10 @@ pub struct RuntimeBuilder<D> {
     // blocking handle
     #[cfg(feature = "sync")]
     blocking_handle: crate::blocking::BlockingHandle,
+
+    // Poll spin duration in microseconds for the io_uring driver
+    poll_spin_us: Option<u64>,
+
     // driver mark
     _mark: PhantomData<D>,
 }
@@ -64,6 +68,7 @@ impl<T> RuntimeBuilder<T> {
 
             #[cfg(feature = "sync")]
             blocking_handle: crate::blocking::BlockingStrategy::ExecuteLocal.into(),
+            poll_spin_us: None,
             _mark: PhantomData,
         }
     }
@@ -127,11 +132,20 @@ impl Buildable for IoUringDriver {
         let thread_id = gen_id();
         #[cfg(feature = "sync")]
         let blocking_handle = this.blocking_handle;
+        let poll_spin_us = this.poll_spin_us;
 
         BUILD_THREAD_ID.set(&thread_id, || {
             let driver = match this.entries {
-                Some(entries) => IoUringDriver::new_with_entries(&this.urb, entries)?,
-                None => IoUringDriver::new(&this.urb)?,
+                Some(entries) => {
+                    IoUringDriver::new_with_entries(&this.urb, entries, poll_spin_us)?
+                }
+                None => {
+                    IoUringDriver::new_with_entries(
+                        &this.urb,
+                        IoUringDriver::DEFAULT_ENTRIES,
+                        poll_spin_us,
+                    )?
+                }
             };
             #[cfg(feature = "sync")]
             let context = crate::runtime::Context::new(blocking_handle);
@@ -167,6 +181,33 @@ impl<D> RuntimeBuilder<D> {
         self.urb = urb;
         self
     }
+
+    /// Set the poll-spin duration in microseconds for the io_uring driver.
+    ///
+    /// When set, the driver will spin-poll the io_uring completion queue ring
+    /// (a shared-memory read, no syscall) for up to this duration before falling
+    /// back to the blocking `io_uring_enter(min_complete=1)` syscall. This
+    /// reduces per-yield latency at the cost of CPU usage.
+    ///
+    /// A value of 0 means no spinning (default behavior). A common value for
+    /// latency-sensitive workloads is 200 (200 microseconds, matching Seastar's
+    /// default `max_poll_time`).
+    #[must_use]
+    pub fn poll_spin_us(mut self, us: u64) -> Self {
+        self.poll_spin_us = if us == 0 { None } else { Some(us) };
+        self
+    }
+
+    /// Enable poll mode: spin indefinitely without ever blocking.
+    ///
+    /// Equivalent to `poll_spin_us(u64::MAX)`. This burns 100% CPU per
+    /// reactor thread but eliminates all kernel transition overhead, matching
+    /// Seastar/ScyllaDB's `--poll-mode` behavior.
+    #[must_use]
+    pub fn poll_mode(mut self, enabled: bool) -> Self {
+        self.poll_spin_us = if enabled { Some(u64::MAX) } else { None };
+        self
+    }
 }
 
 // ===== FusionDriver =====
@@ -186,6 +227,7 @@ impl RuntimeBuilder<FusionDriver> {
                 urb: self.urb,
                 #[cfg(feature = "sync")]
                 blocking_handle: self.blocking_handle,
+                poll_spin_us: self.poll_spin_us,
                 _mark: PhantomData,
             };
             info!("io_uring driver built");
@@ -196,6 +238,7 @@ impl RuntimeBuilder<FusionDriver> {
                 urb: self.urb,
                 #[cfg(feature = "sync")]
                 blocking_handle: self.blocking_handle,
+                poll_spin_us: self.poll_spin_us,
                 _mark: PhantomData,
             };
             info!("legacy driver built");
@@ -210,6 +253,7 @@ impl RuntimeBuilder<FusionDriver> {
             entries: self.entries,
             #[cfg(feature = "sync")]
             blocking_handle: self.blocking_handle,
+            poll_spin_us: self.poll_spin_us,
             _mark: PhantomData,
         };
         Ok(builder.build()?.into())
@@ -223,6 +267,7 @@ impl RuntimeBuilder<FusionDriver> {
             urb: self.urb,
             #[cfg(feature = "sync")]
             blocking_handle: self.blocking_handle,
+            poll_spin_us: self.poll_spin_us,
             _mark: PhantomData,
         };
         Ok(builder.build()?.into())
@@ -242,6 +287,7 @@ impl RuntimeBuilder<TimeDriver<FusionDriver>> {
                 urb: self.urb,
                 #[cfg(feature = "sync")]
                 blocking_handle: self.blocking_handle,
+                poll_spin_us: self.poll_spin_us,
                 _mark: PhantomData,
             };
             info!("io_uring driver with timer built");
@@ -252,6 +298,7 @@ impl RuntimeBuilder<TimeDriver<FusionDriver>> {
                 urb: self.urb,
                 #[cfg(feature = "sync")]
                 blocking_handle: self.blocking_handle,
+                poll_spin_us: self.poll_spin_us,
                 _mark: PhantomData,
             };
             info!("legacy driver with timer built");
@@ -266,6 +313,7 @@ impl RuntimeBuilder<TimeDriver<FusionDriver>> {
             entries: self.entries,
             #[cfg(feature = "sync")]
             blocking_handle: self.blocking_handle,
+            poll_spin_us: self.poll_spin_us,
             _mark: PhantomData,
         };
         Ok(builder.build()?.into())
@@ -279,6 +327,7 @@ impl RuntimeBuilder<TimeDriver<FusionDriver>> {
             urb: self.urb,
             #[cfg(feature = "sync")]
             blocking_handle: self.blocking_handle,
+            poll_spin_us: self.poll_spin_us,
             _mark: PhantomData,
         };
         Ok(builder.build()?.into())
@@ -312,6 +361,7 @@ where
             urb: this.urb,
             #[cfg(feature = "sync")]
             blocking_handle: this.blocking_handle,
+            poll_spin_us: this.poll_spin_us,
             _mark: PhantomData,
         })?;
 
@@ -340,6 +390,7 @@ impl<D: time_wrap::TimeWrapable> RuntimeBuilder<D> {
             urb,
             #[cfg(feature = "sync")]
             blocking_handle,
+            poll_spin_us,
             ..
         } = self;
         RuntimeBuilder {
@@ -348,6 +399,7 @@ impl<D: time_wrap::TimeWrapable> RuntimeBuilder<D> {
             urb,
             #[cfg(feature = "sync")]
             blocking_handle,
+            poll_spin_us,
             _mark: PhantomData,
         }
     }

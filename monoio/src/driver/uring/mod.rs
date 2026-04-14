@@ -44,6 +44,12 @@ pub(crate) const MIN_REVERSED_USERDATA: u64 = u64::MAX - 3;
 pub struct IoUringDriver {
     inner: Rc<UnsafeCell<UringInner>>,
 
+    /// Poll spin duration in microseconds. When set, the driver will spin-poll
+    /// the io_uring CQ ring (shared memory read, no syscall) before falling
+    /// back to a blocking io_uring_enter. This reduces per-yield latency at
+    /// the cost of CPU usage.
+    poll_spin_us: Option<u64>,
+
     // Used for drop
     #[cfg(feature = "sync")]
     thread_id: usize,
@@ -94,13 +100,14 @@ impl IoUringDriver {
     const DEFAULT_ENTRIES: u32 = 1024;
 
     pub(crate) fn new(b: &io_uring::Builder) -> io::Result<IoUringDriver> {
-        Self::new_with_entries(b, Self::DEFAULT_ENTRIES)
+        Self::new_with_entries(b, Self::DEFAULT_ENTRIES, None)
     }
 
     #[cfg(not(feature = "sync"))]
     pub(crate) fn new_with_entries(
         urb: &io_uring::Builder,
         entries: u32,
+        poll_spin_us: Option<u64>,
     ) -> io::Result<IoUringDriver> {
         let uring = ManuallyDrop::new(urb.build(entries)?);
 
@@ -115,13 +122,17 @@ impl IoUringDriver {
             uring,
         }));
 
-        Ok(IoUringDriver { inner })
+        Ok(IoUringDriver {
+            inner,
+            poll_spin_us,
+        })
     }
 
     #[cfg(feature = "sync")]
     pub(crate) fn new_with_entries(
         urb: &io_uring::Builder,
         entries: u32,
+        poll_spin_us: Option<u64>,
     ) -> io::Result<IoUringDriver> {
         let uring = ManuallyDrop::new(urb.build(entries)?);
 
@@ -152,7 +163,11 @@ impl IoUringDriver {
         }));
 
         let thread_id = crate::builder::BUILD_THREAD_ID.with(|id| *id);
-        let driver = IoUringDriver { inner, thread_id };
+        let driver = IoUringDriver {
+            inner,
+            poll_spin_us,
+            thread_id,
+        };
 
         // Register unpark handle
         super::thread::register_unpark_handle(thread_id, driver.unpark().into());
@@ -243,6 +258,66 @@ impl IoUringDriver {
         }
 
         if need_wait {
+            // Poll-spin mode: before blocking on io_uring_enter, submit any
+            // pending SQEs and then spin-poll the CQ ring from shared memory.
+            // The CQ ring is mmap'd — reading it is a memory load (no syscall).
+            // This eliminates the ~0.6ms per-yield overhead from the blocking
+            // io_uring_enter(min_complete=1) path.
+            if let Some(spin_us) = self.poll_spin_us {
+                // Submit pending SQEs without blocking (min_complete=0).
+                inner.submit()?;
+
+                // Check if completions are already available.
+                inner.tick()?;
+                if inner.ops.slab.len() == 0 {
+                    // No in-flight ops, no point spinning.
+                } else {
+                    // Check if tick() found any completions by peeking the CQ.
+                    // The CQ is already consumed by tick() above, so we need
+                    // to spin: repeatedly peek the CQ ring until completions
+                    // arrive or the spin budget expires.
+                    let budget = Duration::from_micros(spin_us);
+                    let start = std::time::Instant::now();
+                    loop {
+                        // Peek the CQ ring — pure shared-memory read, no syscall.
+                        let cq = inner.uring.completion();
+                        let mut found = false;
+                        for cqe in cq {
+                            found = true;
+                            let index = cqe.user_data();
+                            match index {
+                                #[cfg(feature = "sync")]
+                                EVENTFD_USERDATA => inner.eventfd_installed = false,
+                                #[cfg(feature = "poll-io")]
+                                POLLER_USERDATA => {
+                                    inner.poller_installed = false;
+                                    inner.poll.tick(Some(Duration::ZERO))?;
+                                }
+                                _ if index >= MIN_REVERSED_USERDATA => (),
+                                _ => unsafe {
+                                    inner
+                                        .ops
+                                        .complete(index as _, resultify(&cqe), cqe.flags())
+                                },
+                            }
+                        }
+                        if found {
+                            // Completions processed, no need to block.
+                            #[cfg(feature = "sync")]
+                            inner
+                                .shared_waker
+                                .awake
+                                .store(true, std::sync::atomic::Ordering::Release);
+                            return Ok(());
+                        }
+                        if start.elapsed() >= budget {
+                            break; // Spin budget exhausted, fall through to blocking.
+                        }
+                        std::hint::spin_loop();
+                    }
+                }
+            }
+
             // Install timeout and eventfd for unpark if sync is enabled
 
             // 1. alloc spaces
