@@ -50,6 +50,17 @@ pub struct IoUringDriver {
     /// the cost of CPU usage.
     poll_spin_us: Option<u64>,
 
+    /// Adaptive non-blocking reactor mode. When true, the driver never calls
+    /// `io_uring_enter(min_complete=1)` while I/O ops are in flight. Instead:
+    ///   1. `submit()` — non-blocking push SQEs to kernel
+    ///   2. `tick()` — read CQEs from mmap'd CQ ring (no syscall)
+    ///   3. Return immediately — the runtime task drain loop IS the spin
+    ///   4. Block only when truly idle (no in-flight ops)
+    ///
+    /// This eliminates the per-yield context switch overhead (~0.6ms) that
+    /// dominates latency in the blocking reactor path.
+    poll_reactor: bool,
+
     // Used for drop
     #[cfg(feature = "sync")]
     thread_id: usize,
@@ -100,7 +111,7 @@ impl IoUringDriver {
     pub(crate) const DEFAULT_ENTRIES: u32 = 1024;
 
     pub(crate) fn new(b: &io_uring::Builder) -> io::Result<IoUringDriver> {
-        Self::new_with_entries(b, Self::DEFAULT_ENTRIES, None)
+        Self::new_with_entries(b, Self::DEFAULT_ENTRIES, None, false)
     }
 
     #[cfg(not(feature = "sync"))]
@@ -108,6 +119,7 @@ impl IoUringDriver {
         urb: &io_uring::Builder,
         entries: u32,
         poll_spin_us: Option<u64>,
+        poll_reactor: bool,
     ) -> io::Result<IoUringDriver> {
         let uring = ManuallyDrop::new(urb.build(entries)?);
 
@@ -125,6 +137,7 @@ impl IoUringDriver {
         Ok(IoUringDriver {
             inner,
             poll_spin_us,
+            poll_reactor,
         })
     }
 
@@ -133,6 +146,7 @@ impl IoUringDriver {
         urb: &io_uring::Builder,
         entries: u32,
         poll_spin_us: Option<u64>,
+        poll_reactor: bool,
     ) -> io::Result<IoUringDriver> {
         let uring = ManuallyDrop::new(urb.build(entries)?);
 
@@ -166,6 +180,7 @@ impl IoUringDriver {
         let driver = IoUringDriver {
             inner,
             poll_spin_us,
+            poll_reactor,
             thread_id,
         };
 
@@ -228,8 +243,146 @@ impl IoUringDriver {
         let _ = unsafe { sq.push(&entry) };
     }
 
+    /// Adaptive non-blocking reactor park.
+    ///
+    /// Instead of the blocking `submit_and_wait(1)` path, this:
+    /// 1. Submits pending SQEs non-blocking (`io_uring_enter(submit=N, min_complete=0)`)
+    /// 2. Polls CQ ring from shared memory (no syscall)
+    /// 3. Returns immediately if in-flight ops exist (the runtime task drain
+    ///    loop IS the spin — no explicit busy-wait needed)
+    /// 4. Blocks only when truly idle (no in-flight ops) to save CPU
+    fn inner_park_poll(
+        &self,
+        inner: &mut UringInner,
+        timeout: Option<Duration>,
+    ) -> io::Result<()> {
+        // Process cross-thread wakers before anything else.
+        #[cfg(feature = "sync")]
+        {
+            let mut has_wakers = false;
+            while let Ok(w) = inner.waker_receiver.try_recv() {
+                w.wake();
+                has_wakers = true;
+            }
+            if has_wakers {
+                // Wakers found — don't block, just submit and return.
+                inner.submit()?;
+                inner.tick()?;
+                return Ok(());
+            }
+        }
+
+        // Step 1: Submit any pending SQEs non-blocking.
+        inner.submit()?;
+
+        // Step 2: Poll CQ ring from shared memory (no syscall).
+        inner.tick()?;
+
+        // Step 3: Idle detection.
+        // If there are in-flight ops, return immediately — the runtime loop
+        // will drain tasks (which may generate more SQEs), call submit() on
+        // the next iteration, and come back to park(). This keeps the loop
+        // spinning naturally without an explicit busy-spin.
+        if inner.ops.slab.len() > 0 {
+            // In-flight ops exist. Return without blocking so the runtime
+            // can drain tasks and come back. This is the hot path under load.
+            #[cfg(feature = "sync")]
+            inner
+                .shared_waker
+                .awake
+                .store(true, std::sync::atomic::Ordering::Release);
+            return Ok(());
+        }
+
+        // Step 4: Truly idle — no in-flight ops, nothing to poll for.
+        // Block to save CPU. Install eventfd for cross-thread wakeup.
+        #[cfg(feature = "sync")]
+        {
+            inner
+                .shared_waker
+                .awake
+                .store(false, std::sync::atomic::Ordering::Release);
+
+            // Double-check wakers after setting awake=false (barrier pattern).
+            while let Ok(w) = inner.waker_receiver.try_recv() {
+                w.wake();
+                inner
+                    .shared_waker
+                    .awake
+                    .store(true, std::sync::atomic::Ordering::Release);
+                // Waker arrived — don't block.
+                inner.submit()?;
+                inner.tick()?;
+                return Ok(());
+            }
+        }
+
+        // Allocate space for eventfd/poller/timeout SQEs.
+        let mut space = 0;
+        #[cfg(feature = "sync")]
+        if !inner.eventfd_installed {
+            space += 1;
+        }
+        #[cfg(feature = "poll-io")]
+        if !inner.poller_installed {
+            space += 1;
+        }
+        if timeout.is_some() {
+            space += 1;
+        }
+        if space != 0 {
+            Self::flush_space(inner, space)?;
+        }
+
+        #[cfg(feature = "poll-io")]
+        if !inner.poller_installed {
+            self.install_poller(inner, inner.poll.as_raw_fd());
+        }
+
+        #[cfg(feature = "sync")]
+        if !inner.eventfd_installed {
+            self.install_eventfd(inner, inner.shared_waker.as_raw_fd());
+        }
+
+        // Block with or without timeout.
+        if let Some(duration) = timeout {
+            match inner.ext_arg {
+                false => {
+                    self.install_timeout(inner, duration);
+                    inner.uring.submit_and_wait(1)?;
+                }
+                true => {
+                    let timespec = timespec(duration);
+                    let args = io_uring::types::SubmitArgs::new().timespec(&timespec);
+                    if let Err(e) = inner.uring.submitter().submit_with_args(1, &args) {
+                        if e.raw_os_error() != Some(libc::ETIME) {
+                            return Err(e);
+                        }
+                    }
+                }
+            }
+        } else {
+            inner.uring.submit_and_wait(1)?;
+        }
+
+        #[cfg(feature = "sync")]
+        inner
+            .shared_waker
+            .awake
+            .store(true, std::sync::atomic::Ordering::Release);
+
+        inner.tick()?;
+        Ok(())
+    }
+
     fn inner_park(&self, timeout: Option<Duration>) -> io::Result<()> {
         let inner = unsafe { &mut *self.inner.get() };
+
+        // Poll reactor mode: adaptive non-blocking reactor.
+        // Never block when I/O ops are in flight; only block when truly idle.
+        if self.poll_reactor {
+            return self.inner_park_poll(inner, timeout);
+        }
 
         #[allow(unused_mut)]
         let mut need_wait = true;
