@@ -265,15 +265,23 @@ impl IoUringDriver {
                 has_wakers = true;
             }
             if has_wakers {
-                // Wakers found — don't block, just submit and return.
-                inner.submit()?;
+                // Wakers found — don't block. Submit only if SQEs pending.
+                if !inner.uring.submission().is_empty() {
+                    inner.submit()?;
+                }
                 inner.tick()?;
                 return Ok(());
             }
         }
 
         // Step 1: Submit any pending SQEs non-blocking.
-        inner.submit()?;
+        // Only issue the io_uring_enter syscall when there are actually
+        // SQEs to submit. Without this check, we'd call io_uring_enter(0,0)
+        // on every loop iteration even when idle — this was the root cause
+        // of the 33% sys CPU observed in AD.6.
+        if !inner.uring.submission().is_empty() {
+            inner.submit()?;
+        }
 
         // Step 2: Poll CQ ring from shared memory (no syscall).
         inner.tick()?;
