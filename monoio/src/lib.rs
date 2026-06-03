@@ -18,7 +18,7 @@ mod driver;
 pub(crate) mod builder;
 #[allow(dead_code)]
 pub(crate) mod runtime;
-mod scheduler;
+pub mod scheduler;
 pub mod time;
 
 extern crate alloc;
@@ -45,7 +45,8 @@ pub use driver::IoUringDriver;
 pub use driver::LegacyDriver;
 #[cfg(feature = "macros")]
 pub use monoio_macros::{main, test, test_all};
-pub use runtime::{spawn, Runtime};
+pub use runtime::{spawn, spawn_with_priority, Runtime};
+pub use scheduler::TaskPriority;
 #[cfg(any(all(target_os = "linux", feature = "iouring"), feature = "legacy"))]
 pub use {builder::FusionDriver, runtime::FusionRuntime};
 

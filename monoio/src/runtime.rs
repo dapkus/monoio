@@ -141,6 +141,15 @@ impl<D> Runtime<D> {
         let waker = dummy_waker();
         let cx = &mut std::task::Context::from_waker(&waker);
 
+        // AR.2: preempt timer — after this many µs of continuous task execution,
+        // break to io_uring to check for I/O completions before continuing.
+        // Prevents long task chains from starving I/O wakeups.
+        // Default 5ms; override with MONOIO_PREEMPT_US env var.
+        let preempt_us: u64 = std::env::var("MONOIO_PREEMPT_US")
+            .ok()
+            .and_then(|v| v.parse().ok())
+            .unwrap_or(5_000);
+
         self.driver.with(|| {
             CURRENT.set(&self.context, || {
                 #[cfg(feature = "sync")]
@@ -152,37 +161,46 @@ impl<D> Runtime<D> {
                 set_poll();
                 loop {
                     loop {
-                        // Consume all tasks(with max round to prevent io starvation)
-                        let mut max_round = self.context.tasks.len() * 2;
-                        while let Some(t) = self.context.tasks.pop() {
+                        // AR.2: time-bounded task drain.
+                        // Drain high-priority tasks first, then background, but break
+                        // to I/O whenever preempt_us elapses so completions aren't
+                        // delayed by a burst of CPU-bound tasks.
+                        let preempt_deadline =
+                            std::time::Instant::now() + std::time::Duration::from_micros(preempt_us);
+
+                        // Phase 1: drain high-priority tasks until preempted or empty.
+                        while let Some(t) = self.context.tasks.pop_high() {
                             t.run();
-                            if max_round == 0 {
-                                // maybe there's a looping task
+                            if std::time::Instant::now() >= preempt_deadline {
                                 break;
-                            } else {
-                                max_round -= 1;
+                            }
+                        }
+
+                        // Phase 2: if high queue empty, run one background task then
+                        // recheck high queue (avoids background starvation).
+                        if self.context.tasks.high_is_empty() {
+                            if let Some(t) = self.context.tasks.pop() {
+                                t.run();
                             }
                         }
 
                         // Check main future
                         while should_poll() {
-                            // check if ready
                             if let std::task::Poll::Ready(t) = join.as_mut().poll(cx) {
                                 return t;
                             }
                         }
 
                         if self.context.tasks.is_empty() {
-                            // No task to execute, we should wait for io blockingly
-                            // Hot path
+                            // No task to execute, wait for I/O blockingly.
                             break;
                         }
 
-                        // Cold path
+                        // Cold path: submit pending SQEs before looping.
                         let _ = self.driver.submit();
                     }
 
-                    // Wait and Process CQ(the error is ignored for not debug mode)
+                    // Wait and process CQ.
                     #[cfg(not(all(debug_assertions, feature = "debug")))]
                     let _ = self.driver.park();
 
@@ -370,14 +388,26 @@ where
     T: Future + 'static,
     T::Output: 'static,
 {
+    spawn_with_priority(future, crate::scheduler::TaskPriority::High)
+}
+
+/// Spawn with explicit priority (AR.1: two-tier task scheduler).
+///
+/// Use [`TaskPriority::High`] for write-path tasks (CQL handlers, coordinator
+/// futures) and [`TaskPriority::Background`] for compaction, repair, flush.
+pub fn spawn_with_priority<T>(future: T, priority: crate::scheduler::TaskPriority) -> JoinHandle<T::Output>
+where
+    T: Future + 'static,
+    T::Output: 'static,
+{
     let (task, join) = new_task(
         crate::utils::thread_id::get_current_thread_id(),
         future,
-        LocalScheduler,
+        LocalScheduler { priority },
     );
 
     CURRENT.with(|ctx| {
-        ctx.tasks.push(task);
+        ctx.tasks.push(task, priority);
     });
     join
 }
@@ -391,11 +421,11 @@ where
     let (task, join) = new_task_holding(
         crate::utils::thread_id::get_current_thread_id(),
         future,
-        LocalScheduler,
+        LocalScheduler { priority: crate::scheduler::TaskPriority::High },
     );
 
     CURRENT.with(|ctx| {
-        ctx.tasks.push(task);
+        ctx.tasks.push(task, crate::scheduler::TaskPriority::High);
     });
     join
 }
