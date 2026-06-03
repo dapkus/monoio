@@ -200,12 +200,28 @@ impl<D> Runtime<D> {
                         let _ = self.driver.submit();
                     }
 
-                    // Wait and process CQ.
+                    // AR.3: adaptive park — if high-priority tasks are already
+                    // queued (woken by a prior I/O completion), do a non-blocking
+                    // CQ drain (park_timeout=0) instead of a blocking park.
+                    // This eliminates the ~0.5ms wakeup latency for the next
+                    // batch of writes when the shard is saturated.
+                    // When the high queue is empty, fall back to the normal
+                    // blocking park to avoid busy-waiting on idle shards.
                     #[cfg(not(all(debug_assertions, feature = "debug")))]
-                    let _ = self.driver.park();
+                    {
+                        if !self.context.tasks.high_is_empty() {
+                            let _ = self.driver.park_timeout(std::time::Duration::ZERO);
+                        } else {
+                            let _ = self.driver.park();
+                        }
+                    }
 
                     #[cfg(all(debug_assertions, feature = "debug"))]
-                    if let Err(e) = self.driver.park() {
+                    if let Err(e) = if !self.context.tasks.high_is_empty() {
+                        self.driver.park_timeout(std::time::Duration::ZERO)
+                    } else {
+                        self.driver.park()
+                    } {
                         trace!("park error: {:?}", e);
                     }
                 }
