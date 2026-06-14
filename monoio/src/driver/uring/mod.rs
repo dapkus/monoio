@@ -40,6 +40,14 @@ pub(crate) const POLLER_USERDATA: u64 = u64::MAX - 3;
 
 pub(crate) const MIN_REVERSED_USERDATA: u64 = u64::MAX - 3;
 
+/// Default adaptive-spin budget (µs) for the poll-reactor's block decision when
+/// the builder's `poll_spin_us` is unset. When a CQ poll reaps nothing the
+/// reactor spins up to this long for the next completion before blocking — long
+/// enough to bridge the inter-batch gaps that occur under load (so we don't
+/// issue a context-switching `submit_and_wait(1)` on every gap), short enough
+/// that at true idle the spin cost before sleeping is negligible.
+pub(crate) const DEFAULT_POLL_REACTOR_SPIN_US: u64 = 50;
+
 /// Driver with uring.
 pub struct IoUringDriver {
     inner: Rc<UnsafeCell<UringInner>>,
@@ -311,13 +319,57 @@ impl IoUringDriver {
             return Ok(());
         }
 
-        // Step 4: No progress this iteration — block until the next completion.
-        // We block via submit_and_wait(1) even when ops are in flight: it
-        // returns the instant any in-flight op completes (microseconds under
-        // load, so no throughput cost), and at true idle it sleeps until the
-        // next event (0% CPU). The eventfd installed below ensures cross-thread
-        // wakers also unblock us. This is the adaptive spin-then-block contract:
-        // syscall-free while reaping, one io_uring_enter when caught up.
+        // Step 3b: Bounded adaptive spin before blocking.
+        //
+        // A single empty poll does NOT mean idle — under load the CQ ring
+        // momentarily drains between completion batches, and the next batch
+        // lands microseconds later. Blocking on every such gap issues a
+        // `submit_and_wait(1)` (a voluntary context switch) per gap, which
+        // collapses the ctxsw reduction the reactor exists to deliver (E4
+        // Stage 1 re-run: block-on-first-empty gave only ~1.5× vs the ≥5× the
+        // mechanism is capable of). So spin-poll the CQ for a bounded budget
+        // first: if a completion arrives within `POLL_REACTOR_SPIN_US`, keep
+        // spinning (syscall-free); only if the budget expires with the ring
+        // still empty do we conclude we are truly idle and block. This is the
+        // classic adaptive busy-poll: under load the budget is almost always
+        // satisfied (≈one op-interval), so we rarely block; at idle the budget
+        // expires quickly and cheaply (tens of µs per park, negligible CPU).
+        //
+        // Budget source: the builder's `poll_spin_us` (env-tunable via the
+        // Adamas `ADAMAS_POLL_SPIN_US` plumbing) so the value can be swept
+        // without recompiling; falls back to `DEFAULT_POLL_REACTOR_SPIN_US`.
+        {
+            let budget_us = self.poll_spin_us.unwrap_or(DEFAULT_POLL_REACTOR_SPIN_US);
+            if budget_us > 0 {
+                let budget = Duration::from_micros(budget_us);
+                let start = std::time::Instant::now();
+                loop {
+                    // Submit any SQEs generated since the last poll, non-blocking.
+                    if !inner.uring.submission().is_empty() {
+                        inner.submit()?;
+                    }
+                    let r = inner.tick()?;
+                    if r > 0 {
+                        // A completion landed within the budget — active work.
+                        #[cfg(feature = "sync")]
+                        inner
+                            .shared_waker
+                            .awake
+                            .store(true, std::sync::atomic::Ordering::Release);
+                        return Ok(());
+                    }
+                    if start.elapsed() >= budget {
+                        break; // Budget exhausted — truly idle, fall through to block.
+                    }
+                    std::hint::spin_loop();
+                }
+            }
+        }
+
+        // Step 4: Budget expired with no completions — truly idle. Block until
+        // the next completion. submit_and_wait(1) returns the instant any
+        // in-flight op completes and sleeps at true idle (0% CPU). The eventfd
+        // installed below ensures cross-thread wakers also unblock us.
         #[cfg(feature = "sync")]
         {
             inner
