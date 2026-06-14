@@ -283,17 +283,26 @@ impl IoUringDriver {
             inner.submit()?;
         }
 
-        // Step 2: Poll CQ ring from shared memory (no syscall).
-        inner.tick()?;
+        // Step 2: Poll CQ ring from shared memory (no syscall). `reaped` is the
+        // number of completions processed this iteration — the progress signal.
+        let reaped = inner.tick()?;
 
-        // Step 3: Idle detection.
-        // If there are in-flight ops, return immediately — the runtime loop
-        // will drain tasks (which may generate more SQEs), call submit() on
-        // the next iteration, and come back to park(). This keeps the loop
-        // spinning naturally without an explicit busy-spin.
-        if inner.ops.slab.len() > 0 {
-            // In-flight ops exist. Return without blocking so the runtime
-            // can drain tasks and come back. This is the hot path under load.
+        // Step 3: Progress-based idle detection.
+        //
+        // Spin only while we are making progress. If we reaped completions this
+        // iteration there is active work: return immediately so the runtime
+        // drains the newly-woken tasks (which generate more SQEs), and we come
+        // back to reap again. This is the syscall-free hot path under load.
+        //
+        // Crucially, this gates on `reaped`, NOT on `slab.len()`. Under a live
+        // cluster the slab is essentially never empty — long-lived ops (gossip
+        // timers, internode socket reads awaiting data) keep in-flight ops
+        // present indefinitely. The old `slab.len() > 0` check therefore never
+        // fell through to the blocking path and the worker busy-spun at 100%
+        // CPU at idle (E4 Stage 1: idle burn + −34% under load). A poll that
+        // reaps nothing means no work is ready right now even if ops are in
+        // flight, so we fall through and block.
+        if reaped > 0 {
             #[cfg(feature = "sync")]
             inner
                 .shared_waker
@@ -302,8 +311,13 @@ impl IoUringDriver {
             return Ok(());
         }
 
-        // Step 4: Truly idle — no in-flight ops, nothing to poll for.
-        // Block to save CPU. Install eventfd for cross-thread wakeup.
+        // Step 4: No progress this iteration — block until the next completion.
+        // We block via submit_and_wait(1) even when ops are in flight: it
+        // returns the instant any in-flight op completes (microseconds under
+        // load, so no throughput cost), and at true idle it sleeps until the
+        // next event (0% CPU). The eventfd installed below ensures cross-thread
+        // wakers also unblock us. This is the adaptive spin-then-block contract:
+        // syscall-free while reaping, one io_uring_enter when caught up.
         #[cfg(feature = "sync")]
         {
             inner
@@ -602,10 +616,17 @@ impl Driver for IoUringDriver {
 }
 
 impl UringInner {
-    fn tick(&mut self) -> io::Result<()> {
+    /// Reap the completion queue. Returns the number of CQEs processed this
+    /// call. The count drives the poll-reactor's adaptive idle detection
+    /// (`inner_park_poll`): spin while we are reaping completions, block when a
+    /// poll comes up empty. Callers that don't need the count can ignore it
+    /// (`inner.tick()?;` still type-checks — the usize is discarded by `?`).
+    fn tick(&mut self) -> io::Result<usize> {
         let cq = self.uring.completion();
 
+        let mut reaped: usize = 0;
         for cqe in cq {
+            reaped += 1;
             let index = cqe.user_data();
             match index {
                 #[cfg(feature = "sync")]
@@ -621,7 +642,7 @@ impl UringInner {
                 _ => unsafe { self.ops.complete(index as _, resultify(&cqe), cqe.flags()) },
             }
         }
-        Ok(())
+        Ok(reaped)
     }
 
     fn submit(&mut self) -> io::Result<()> {
