@@ -17,6 +17,86 @@ use crate::{
     time::driver::Handle as TimeHandle,
 };
 
+// ── Reactor stall detector (phase-as/stall-detector) ─────────────────────────
+//
+// When `ADAMAS_STALL_DETECTOR_MS=N` is set (N > 0), each task `poll()` is
+// bracketed by a monotonic timestamp. If the poll takes longer than N ms, an
+// event is published via the shard-registered callback so adamas can log it and
+// bump its per-shard stall counters.
+//
+// **Zero overhead when off.** `STALL_HOOK` is `None` by default. The only
+// hot-path cost when unset is a single `Option::is_some()` check per task
+// run — one branch on a thread-local, predicted-not-taken.
+//
+// **No extra threads.** The detector runs inline in each shard's own reactor
+// loop. There is no watchdog thread, no signal handler.
+
+/// Per-stall event delivered to the registered callback.
+#[derive(Debug, Clone)]
+pub struct StallEvent {
+    /// Duration of the stalling poll in milliseconds.
+    pub duration_ms: u64,
+}
+
+/// Type of the per-shard stall callback.
+///
+/// The callback is called inline from the reactor loop with the shard holding
+/// no locks. It must be cheap (bump an atomic counter, write to a lock-free
+/// log). It must never block or yield.
+pub type StallCallback = fn(StallEvent);
+
+thread_local! {
+    /// Per-shard stall-detector hook. `None` = off (zero overhead).
+    ///
+    /// Set by adamas at shard startup when `ADAMAS_STALL_DETECTOR_MS` is present.
+    /// Cleared on shard shutdown.
+    static STALL_HOOK: std::cell::Cell<Option<(u64, StallCallback)>> =
+        std::cell::Cell::new(None);
+}
+
+/// Register a stall callback for the current shard.
+///
+/// `threshold_ms` — minimum task poll duration (in milliseconds) that triggers
+/// a callback. Pass 0 to disable.
+///
+/// Must be called from the shard's own reactor thread before `block_on`.
+pub fn register_stall_callback(threshold_ms: u64, cb: StallCallback) {
+    if threshold_ms == 0 {
+        STALL_HOOK.with(|h| h.set(None));
+    } else {
+        STALL_HOOK.with(|h| h.set(Some((threshold_ms, cb))));
+    }
+}
+
+/// Remove the stall callback for the current shard (disables detection).
+pub fn unregister_stall_callback() {
+    STALL_HOOK.with(|h| h.set(None));
+}
+
+/// Inline macro: run one `Task<LocalScheduler>`, optionally measuring duration.
+///
+/// When the stall hook is absent (`None`), this compiles down to a plain
+/// `$task.run()` with a single not-taken branch on the thread-local — zero
+/// overhead in the off case.  We use a macro (not a generic fn) because
+/// `Task<S>` has `run(self)` but no common trait; the macro keeps the
+/// call-site type concrete.
+macro_rules! run_task {
+    ($task:expr) => {{
+        let hook = STALL_HOOK.with(|h| h.get());
+        match hook {
+            None => $task.run(),
+            Some((threshold_ms, cb)) => {
+                let t0 = std::time::Instant::now();
+                $task.run();
+                let elapsed_ms = t0.elapsed().as_millis() as u64;
+                if elapsed_ms >= threshold_ms {
+                    cb(StallEvent { duration_ms: elapsed_ms });
+                }
+            }
+        }
+    }};
+}
+
 #[cfg(feature = "sync")]
 thread_local! {
     pub(crate) static DEFAULT_CTX: Context = Context {
@@ -170,7 +250,7 @@ impl<D> Runtime<D> {
 
                         // Phase 1: drain high-priority tasks until preempted or empty.
                         while let Some(t) = self.context.tasks.pop_high() {
-                            t.run();
+                            run_task!(t);
                             if std::time::Instant::now() >= preempt_deadline {
                                 break;
                             }
@@ -180,7 +260,7 @@ impl<D> Runtime<D> {
                         // recheck high queue (avoids background starvation).
                         if self.context.tasks.high_is_empty() {
                             if let Some(t) = self.context.tasks.pop() {
-                                t.run();
+                                run_task!(t);
                             }
                         }
 
