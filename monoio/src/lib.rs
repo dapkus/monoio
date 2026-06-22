@@ -27,6 +27,7 @@ extern crate alloc;
 pub mod blocking;
 
 pub mod buf;
+pub mod client_gate;
 pub mod fs;
 pub mod io;
 pub mod net;
@@ -38,6 +39,7 @@ use std::future::Future;
 #[cfg(feature = "sync")]
 pub use blocking::spawn_blocking;
 pub use builder::{Buildable, RuntimeBuilder};
+pub use client_gate::{client_request_begin, client_request_end};
 pub use driver::Driver;
 #[cfg(all(target_os = "linux", feature = "iouring"))]
 pub use driver::IoUringDriver;
@@ -45,8 +47,8 @@ pub use driver::IoUringDriver;
 pub use driver::LegacyDriver;
 #[cfg(feature = "macros")]
 pub use monoio_macros::{main, test, test_all};
-pub use runtime::{spawn, spawn_with_priority, Runtime};
 pub use runtime::{register_stall_callback, unregister_stall_callback, StallCallback, StallEvent};
+pub use runtime::{spawn, spawn_with_priority, Runtime};
 pub use scheduler::TaskPriority;
 #[cfg(any(all(target_os = "linux", feature = "iouring"), feature = "legacy"))]
 pub use {builder::FusionDriver, runtime::FusionRuntime};

@@ -32,6 +32,10 @@ pub struct RuntimeBuilder<D> {
     // Adaptive non-blocking reactor mode
     poll_reactor: bool,
 
+    // Client-gated variant of the poll-reactor (only meaningful when
+    // poll_reactor is also enabled)
+    poll_reactor_client_gated: bool,
+
     // driver mark
     _mark: PhantomData<D>,
 }
@@ -73,6 +77,7 @@ impl<T> RuntimeBuilder<T> {
             blocking_handle: crate::blocking::BlockingStrategy::ExecuteLocal.into(),
             poll_spin_us: None,
             poll_reactor: false,
+            poll_reactor_client_gated: false,
             _mark: PhantomData,
         }
     }
@@ -138,20 +143,24 @@ impl Buildable for IoUringDriver {
         let blocking_handle = this.blocking_handle;
         let poll_spin_us = this.poll_spin_us;
         let poll_reactor = this.poll_reactor;
+        let poll_reactor_client_gated = this.poll_reactor_client_gated;
 
         BUILD_THREAD_ID.set(&thread_id, || {
             let driver = match this.entries {
-                Some(entries) => {
-                    IoUringDriver::new_with_entries(&this.urb, entries, poll_spin_us, poll_reactor)?
-                }
-                None => {
-                    IoUringDriver::new_with_entries(
-                        &this.urb,
-                        IoUringDriver::DEFAULT_ENTRIES,
-                        poll_spin_us,
-                        poll_reactor,
-                    )?
-                }
+                Some(entries) => IoUringDriver::new_with_entries(
+                    &this.urb,
+                    entries,
+                    poll_spin_us,
+                    poll_reactor,
+                    poll_reactor_client_gated,
+                )?,
+                None => IoUringDriver::new_with_entries(
+                    &this.urb,
+                    IoUringDriver::DEFAULT_ENTRIES,
+                    poll_spin_us,
+                    poll_reactor,
+                    poll_reactor_client_gated,
+                )?,
             };
             #[cfg(feature = "sync")]
             let context = crate::runtime::Context::new(blocking_handle);
@@ -234,6 +243,22 @@ impl<D> RuntimeBuilder<D> {
         self.poll_reactor = enabled;
         self
     }
+
+    /// Enable the client-gated variant of the adaptive non-blocking reactor.
+    ///
+    /// Only meaningful when [`Self::poll_reactor`] is also enabled. When set,
+    /// the reactor's bounded adaptive spin before blocking runs only while a
+    /// *client* request is in flight on this shard (tracked via
+    /// [`crate::client_request_begin`] / [`crate::client_request_end`]). At
+    /// client idle the reactor falls straight through to the blocking path
+    /// instead of busy-polling gossip/internode completions, eliminating the
+    /// idle-CPU tax of the unconditional spin while preserving the syscall-free
+    /// hot path under client load.
+    #[must_use]
+    pub fn poll_reactor_client_gated(mut self, enabled: bool) -> Self {
+        self.poll_reactor_client_gated = enabled;
+        self
+    }
 }
 
 // ===== FusionDriver =====
@@ -255,6 +280,7 @@ impl RuntimeBuilder<FusionDriver> {
                 blocking_handle: self.blocking_handle,
                 poll_spin_us: self.poll_spin_us,
                 poll_reactor: self.poll_reactor,
+                poll_reactor_client_gated: self.poll_reactor_client_gated,
                 _mark: PhantomData,
             };
             info!("io_uring driver built");
@@ -267,6 +293,7 @@ impl RuntimeBuilder<FusionDriver> {
                 blocking_handle: self.blocking_handle,
                 poll_spin_us: self.poll_spin_us,
                 poll_reactor: self.poll_reactor,
+                poll_reactor_client_gated: self.poll_reactor_client_gated,
                 _mark: PhantomData,
             };
             info!("legacy driver built");
@@ -283,6 +310,7 @@ impl RuntimeBuilder<FusionDriver> {
             blocking_handle: self.blocking_handle,
             poll_spin_us: self.poll_spin_us,
             poll_reactor: self.poll_reactor,
+            poll_reactor_client_gated: self.poll_reactor_client_gated,
             _mark: PhantomData,
         };
         Ok(builder.build()?.into())
@@ -298,6 +326,7 @@ impl RuntimeBuilder<FusionDriver> {
             blocking_handle: self.blocking_handle,
             poll_spin_us: self.poll_spin_us,
             poll_reactor: self.poll_reactor,
+            poll_reactor_client_gated: self.poll_reactor_client_gated,
             _mark: PhantomData,
         };
         Ok(builder.build()?.into())
@@ -319,6 +348,7 @@ impl RuntimeBuilder<TimeDriver<FusionDriver>> {
                 blocking_handle: self.blocking_handle,
                 poll_spin_us: self.poll_spin_us,
                 poll_reactor: self.poll_reactor,
+                poll_reactor_client_gated: self.poll_reactor_client_gated,
                 _mark: PhantomData,
             };
             info!("io_uring driver with timer built");
@@ -331,6 +361,7 @@ impl RuntimeBuilder<TimeDriver<FusionDriver>> {
                 blocking_handle: self.blocking_handle,
                 poll_spin_us: self.poll_spin_us,
                 poll_reactor: self.poll_reactor,
+                poll_reactor_client_gated: self.poll_reactor_client_gated,
                 _mark: PhantomData,
             };
             info!("legacy driver with timer built");
@@ -347,6 +378,7 @@ impl RuntimeBuilder<TimeDriver<FusionDriver>> {
             blocking_handle: self.blocking_handle,
             poll_spin_us: self.poll_spin_us,
             poll_reactor: self.poll_reactor,
+            poll_reactor_client_gated: self.poll_reactor_client_gated,
             _mark: PhantomData,
         };
         Ok(builder.build()?.into())
@@ -362,6 +394,7 @@ impl RuntimeBuilder<TimeDriver<FusionDriver>> {
             blocking_handle: self.blocking_handle,
             poll_spin_us: self.poll_spin_us,
             poll_reactor: self.poll_reactor,
+            poll_reactor_client_gated: self.poll_reactor_client_gated,
             _mark: PhantomData,
         };
         Ok(builder.build()?.into())
@@ -397,6 +430,7 @@ where
             blocking_handle: this.blocking_handle,
             poll_spin_us: this.poll_spin_us,
             poll_reactor: this.poll_reactor,
+            poll_reactor_client_gated: this.poll_reactor_client_gated,
             _mark: PhantomData,
         })?;
 
@@ -427,6 +461,7 @@ impl<D: time_wrap::TimeWrapable> RuntimeBuilder<D> {
             blocking_handle,
             poll_spin_us,
             poll_reactor,
+            poll_reactor_client_gated,
             ..
         } = self;
         RuntimeBuilder {
@@ -437,6 +472,7 @@ impl<D: time_wrap::TimeWrapable> RuntimeBuilder<D> {
             blocking_handle,
             poll_spin_us,
             poll_reactor,
+            poll_reactor_client_gated,
             _mark: PhantomData,
         }
     }

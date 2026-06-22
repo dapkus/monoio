@@ -69,6 +69,14 @@ pub struct IoUringDriver {
     /// dominates latency in the blocking reactor path.
     poll_reactor: bool,
 
+    /// Client-gated variant of the poll-reactor. When true (and `poll_reactor`
+    /// is also true), the bounded adaptive spin before blocking runs only while
+    /// a *client* request is in flight on this shard (see
+    /// [`crate::client_gate`]). At client idle the reactor falls straight
+    /// through to the blocking path instead of busy-polling gossip/internode
+    /// completions. No effect unless `poll_reactor` is on.
+    poll_reactor_client_gated: bool,
+
     // Used for drop
     #[cfg(feature = "sync")]
     thread_id: usize,
@@ -119,7 +127,7 @@ impl IoUringDriver {
     pub(crate) const DEFAULT_ENTRIES: u32 = 1024;
 
     pub(crate) fn new(b: &io_uring::Builder) -> io::Result<IoUringDriver> {
-        Self::new_with_entries(b, Self::DEFAULT_ENTRIES, None, false)
+        Self::new_with_entries(b, Self::DEFAULT_ENTRIES, None, false, false)
     }
 
     #[cfg(not(feature = "sync"))]
@@ -128,6 +136,7 @@ impl IoUringDriver {
         entries: u32,
         poll_spin_us: Option<u64>,
         poll_reactor: bool,
+        poll_reactor_client_gated: bool,
     ) -> io::Result<IoUringDriver> {
         let uring = ManuallyDrop::new(urb.build(entries)?);
 
@@ -146,6 +155,7 @@ impl IoUringDriver {
             inner,
             poll_spin_us,
             poll_reactor,
+            poll_reactor_client_gated,
         })
     }
 
@@ -155,6 +165,7 @@ impl IoUringDriver {
         entries: u32,
         poll_spin_us: Option<u64>,
         poll_reactor: bool,
+        poll_reactor_client_gated: bool,
     ) -> io::Result<IoUringDriver> {
         let uring = ManuallyDrop::new(urb.build(entries)?);
 
@@ -189,6 +200,7 @@ impl IoUringDriver {
             inner,
             poll_spin_us,
             poll_reactor,
+            poll_reactor_client_gated,
             thread_id,
         };
 
@@ -259,11 +271,7 @@ impl IoUringDriver {
     /// 3. Returns immediately if in-flight ops exist (the runtime task drain
     ///    loop IS the spin — no explicit busy-wait needed)
     /// 4. Blocks only when truly idle (no in-flight ops) to save CPU
-    fn inner_park_poll(
-        &self,
-        inner: &mut UringInner,
-        timeout: Option<Duration>,
-    ) -> io::Result<()> {
+    fn inner_park_poll(&self, inner: &mut UringInner, timeout: Option<Duration>) -> io::Result<()> {
         // Process cross-thread wakers before anything else.
         #[cfg(feature = "sync")]
         {
@@ -339,8 +347,17 @@ impl IoUringDriver {
         // Adamas `ADAMAS_POLL_SPIN_US` plumbing) so the value can be swept
         // without recompiling; falls back to `DEFAULT_POLL_REACTOR_SPIN_US`.
         {
+            // Client-gating: when enabled, skip the speculative idle spin
+            // unless a client request is in flight on this shard. This lets the
+            // reactor park through client-idle gaps instead of busy-polling
+            // gossip/internode completions (the E4-falsified idle-CPU tax). The
+            // `reaped > 0` early-return above is NOT gated — productive client
+            // completions still return immediately; only this speculative spin
+            // is suppressed.
+            let gated_out =
+                self.poll_reactor_client_gated && !crate::client_gate::client_in_flight();
             let budget_us = self.poll_spin_us.unwrap_or(DEFAULT_POLL_REACTOR_SPIN_US);
-            if budget_us > 0 {
+            if budget_us > 0 && !gated_out {
                 let budget = Duration::from_micros(budget_us);
                 let start = std::time::Instant::now();
                 loop {
@@ -515,9 +532,7 @@ impl IoUringDriver {
                             }
                             _ if index >= MIN_REVERSED_USERDATA => (),
                             _ => unsafe {
-                                inner
-                                    .ops
-                                    .complete(index as _, resultify(&cqe), cqe.flags())
+                                inner.ops.complete(index as _, resultify(&cqe), cqe.flags())
                             },
                         }
                     }
