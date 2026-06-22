@@ -31,6 +31,8 @@ pub mod client_gate;
 pub mod fs;
 pub mod io;
 pub mod net;
+#[allow(unused)]
+pub mod reactor_park;
 pub mod task;
 pub mod utils;
 
@@ -47,6 +49,7 @@ pub use driver::IoUringDriver;
 pub use driver::LegacyDriver;
 #[cfg(feature = "macros")]
 pub use monoio_macros::{main, test, test_all};
+pub use reactor_park::reactor_parked_nanos;
 pub use runtime::{register_stall_callback, unregister_stall_callback, StallCallback, StallEvent};
 pub use runtime::{spawn, spawn_with_priority, Runtime};
 pub use scheduler::TaskPriority;

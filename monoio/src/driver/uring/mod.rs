@@ -435,25 +435,32 @@ impl IoUringDriver {
             self.install_eventfd(inner, inner.shared_waker.as_raw_fd());
         }
 
-        // Block with or without timeout.
-        if let Some(duration) = timeout {
-            match inner.ext_arg {
-                false => {
-                    self.install_timeout(inner, duration);
-                    inner.uring.submit_and_wait(1)?;
-                }
-                true => {
-                    let timespec = timespec(duration);
-                    let args = io_uring::types::SubmitArgs::new().timespec(&timespec);
-                    if let Err(e) = inner.uring.submitter().submit_with_args(1, &args) {
-                        if e.raw_os_error() != Some(libc::ETIME) {
-                            return Err(e);
+        // Block with or without timeout. The `ParkScope` guard accumulates the
+        // wall-clock time we spend blocked here into this shard's per-shard
+        // `REACTOR_PARKED_NANOS` (the reactor-utilization diagnostic). It is the
+        // ACTUAL blocking kernel park on the poll-reactor path, so it must be
+        // measured whether poll_reactor is on (here) or off (inner_park below).
+        {
+            let _park = crate::reactor_park::ParkScope::new();
+            if let Some(duration) = timeout {
+                match inner.ext_arg {
+                    false => {
+                        self.install_timeout(inner, duration);
+                        inner.uring.submit_and_wait(1)?;
+                    }
+                    true => {
+                        let timespec = timespec(duration);
+                        let args = io_uring::types::SubmitArgs::new().timespec(&timespec);
+                        if let Err(e) = inner.uring.submitter().submit_with_args(1, &args) {
+                            if e.raw_os_error() != Some(libc::ETIME) {
+                                return Err(e);
+                            }
                         }
                     }
                 }
+            } else {
+                inner.uring.submit_and_wait(1)?;
             }
-        } else {
-            inner.uring.submit_and_wait(1)?;
         }
 
         #[cfg(feature = "sync")]
@@ -584,7 +591,12 @@ impl IoUringDriver {
                 self.install_eventfd(inner, inner.shared_waker.as_raw_fd());
             }
 
-            // 2.3 install timeout and submit_and_wait with timeout
+            // 2.3 install timeout and submit_and_wait with timeout. The
+            // `ParkScope` guard accumulates the wall-clock time blocked here
+            // into this shard's `REACTOR_PARKED_NANOS` — this is the blocking
+            // kernel park on the non-poll-reactor path, the twin of the one in
+            // `inner_park_poll`, so the diagnostic is correct in both modes.
+            let _park = crate::reactor_park::ParkScope::new();
             if let Some(duration) = timeout {
                 match inner.ext_arg {
                     // Submit and Wait with timeout in an TimeoutOp way.
