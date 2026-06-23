@@ -123,6 +123,68 @@ struct Ops {
     slab: Slab<MaybeFdLifecycle>,
 }
 
+/// Set once after the first warn about an unsupported modern-flags kernel, so the
+/// fallback log is emitted at most once per process instead of once per shard.
+static MODERN_FLAGS_FALLBACK_WARNED: std::sync::atomic::AtomicBool =
+    std::sync::atomic::AtomicBool::new(false);
+
+/// Returns true when `ADAMAS_IOURING_MODERN_FLAGS` is set to a truthy value
+/// (`1`/`true`/`yes`/`on`, case-insensitive). Default-off: any other value, an
+/// empty value, or an unset var disables the modern setup flags so the A/B is
+/// clean and vanilla is the safe baseline.
+fn modern_flags_requested() -> bool {
+    std::env::var("ADAMAS_IOURING_MODERN_FLAGS")
+        .ok()
+        .map(|v| {
+            let v = v.trim().to_ascii_lowercase();
+            v == "1" || v == "true" || v == "yes" || v == "on"
+        })
+        .unwrap_or(false)
+}
+
+/// Build the io_uring ring, optionally applying the modern setup flags
+/// (`IORING_SETUP_SINGLE_ISSUER` + `IORING_SETUP_COOP_TASKRUN`) when
+/// `ADAMAS_IOURING_MODERN_FLAGS` is truthy.
+///
+/// These flags cut the per-completion kernel park-tax on a busy thread-per-core
+/// reactor: `COOP_TASKRUN` suppresses the inter-processor interrupt that would
+/// otherwise force-run completion task-work on each CQE (completions are reaped
+/// on the next ring enter instead), and `SINGLE_ISSUER` lets the kernel skip
+/// submitter locking since exactly one thread owns each ring. Both require Linux
+/// 5.19+/6.0+; on an older kernel `build()` fails with `EINVAL`.
+///
+/// Kernel-fallback (T25, no panic): when the modern flags are requested and the
+/// flagged `build()` fails, we retry `build()` on the original (bare) builder so
+/// an unsupported kernel degrades to vanilla io_uring rather than crashing
+/// startup. The fallback is logged once per process.
+fn build_uring(urb: &io_uring::Builder, entries: u32) -> io::Result<IoUring> {
+    if !modern_flags_requested() {
+        return urb.build(entries);
+    }
+
+    // Apply the modern flags to a clone so the shared per-runtime builder is left
+    // untouched (each per-core driver clones + flags its own ring).
+    let mut modern = urb.clone();
+    modern.setup_single_issuer().setup_coop_taskrun();
+    match modern.build(entries) {
+        Ok(ring) => Ok(ring),
+        Err(e) => {
+            if !MODERN_FLAGS_FALLBACK_WARNED.swap(true, std::sync::atomic::Ordering::Relaxed) {
+                // Startup-only diagnostic; use eprintln so it is always visible
+                // regardless of the `debug`/`tracing` feature gate (the in-crate
+                // `info!`/`trace!` macros no-op without it).
+                eprintln!(
+                    "[monoio] WARN: ADAMAS_IOURING_MODERN_FLAGS set but io_uring build with \
+                     SINGLE_ISSUER+COOP_TASKRUN failed ({e}); kernel likely <5.19. \
+                     Falling back to vanilla io_uring setup."
+                );
+            }
+            // Retry on the original bare builder — vanilla, always-supported path.
+            urb.build(entries)
+        }
+    }
+}
+
 impl IoUringDriver {
     pub(crate) const DEFAULT_ENTRIES: u32 = 1024;
 
@@ -138,7 +200,7 @@ impl IoUringDriver {
         poll_reactor: bool,
         poll_reactor_client_gated: bool,
     ) -> io::Result<IoUringDriver> {
-        let uring = ManuallyDrop::new(urb.build(entries)?);
+        let uring = ManuallyDrop::new(build_uring(urb, entries)?);
 
         let inner = Rc::new(UnsafeCell::new(UringInner {
             #[cfg(feature = "poll-io")]
@@ -167,7 +229,7 @@ impl IoUringDriver {
         poll_reactor: bool,
         poll_reactor_client_gated: bool,
     ) -> io::Result<IoUringDriver> {
-        let uring = ManuallyDrop::new(urb.build(entries)?);
+        let uring = ManuallyDrop::new(build_uring(urb, entries)?);
 
         // Create eventfd and register it to the ring.
         let waker = {
@@ -940,5 +1002,70 @@ fn resultify(cqe: &cqueue::Entry) -> io::Result<u32> {
         Ok(res as u32)
     } else {
         Err(io::Error::from_raw_os_error(-res))
+    }
+}
+
+#[cfg(test)]
+mod modern_flags_tests {
+    use super::*;
+
+    /// Serialize the env-var mutation across tests in this module: they all poke
+    /// the same process-global `ADAMAS_IOURING_MODERN_FLAGS`.
+    static ENV_LOCK: std::sync::Mutex<()> = std::sync::Mutex::new(());
+
+    fn with_modern_flags<R>(value: Option<&str>, f: impl FnOnce() -> R) -> R {
+        let _guard = ENV_LOCK.lock().unwrap_or_else(|e| e.into_inner());
+        let prev = std::env::var("ADAMAS_IOURING_MODERN_FLAGS").ok();
+        match value {
+            Some(v) => std::env::set_var("ADAMAS_IOURING_MODERN_FLAGS", v),
+            None => std::env::remove_var("ADAMAS_IOURING_MODERN_FLAGS"),
+        }
+        let out = f();
+        match prev {
+            Some(v) => std::env::set_var("ADAMAS_IOURING_MODERN_FLAGS", v),
+            None => std::env::remove_var("ADAMAS_IOURING_MODERN_FLAGS"),
+        }
+        out
+    }
+
+    #[test]
+    fn modern_flags_requested_parses_truthy_and_falsy() {
+        for v in ["1", "true", "TRUE", "Yes", "on", " on "] {
+            with_modern_flags(Some(v), || {
+                assert!(modern_flags_requested(), "{v:?} should be truthy");
+            });
+        }
+        for v in ["0", "false", "no", "off", "", "garbage"] {
+            with_modern_flags(Some(v), || {
+                assert!(!modern_flags_requested(), "{v:?} should be falsy");
+            });
+        }
+        with_modern_flags(None, || {
+            assert!(!modern_flags_requested(), "unset should default off");
+        });
+    }
+
+    /// Vanilla path (flags off): must always build a usable ring.
+    #[test]
+    fn build_uring_vanilla_succeeds() {
+        with_modern_flags(Some("0"), || {
+            let urb = IoUring::builder();
+            build_uring(&urb, 256).expect("vanilla io_uring build must succeed");
+        });
+    }
+
+    /// Modern path (flags on): must build successfully on a supporting kernel
+    /// (5.19+) OR transparently fall back to vanilla on an older kernel — in
+    /// neither case may it error out. This exercises the kernel-fallback path on
+    /// CI machines that may not support the flags.
+    #[test]
+    fn build_uring_modern_builds_or_falls_back() {
+        with_modern_flags(Some("1"), || {
+            let urb = IoUring::builder();
+            // Whether or not SINGLE_ISSUER+COOP_TASKRUN are supported, build_uring
+            // must yield a ring: supported -> flagged ring, unsupported -> vanilla.
+            build_uring(&urb, 256)
+                .expect("build_uring with modern flags must succeed or fall back, never error");
+        });
     }
 }
