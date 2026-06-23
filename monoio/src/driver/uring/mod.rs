@@ -128,18 +128,19 @@ struct Ops {
 static MODERN_FLAGS_FALLBACK_WARNED: std::sync::atomic::AtomicBool =
     std::sync::atomic::AtomicBool::new(false);
 
-/// Returns true when `ADAMAS_IOURING_MODERN_FLAGS` is set to a truthy value
-/// (`1`/`true`/`yes`/`on`, case-insensitive). Default-off: any other value, an
-/// empty value, or an unset var disables the modern setup flags so the A/B is
-/// clean and vanilla is the safe baseline.
+/// Returns true unless `ADAMAS_IOURING_MODERN_FLAGS` is explicitly set to a falsy
+/// value (`0`/`false`/`no`/`off`, case-insensitive). DEFAULT-ON (validated
+/// 2026-06-23: −13% reactor parking / +3.8% write throughput; pure efficiency,
+/// kernel-fallback-safe via `build_uring`). Set the var falsy to force vanilla
+/// io_uring (e.g. for an A/B baseline).
 fn modern_flags_requested() -> bool {
-    std::env::var("ADAMAS_IOURING_MODERN_FLAGS")
-        .ok()
-        .map(|v| {
+    match std::env::var("ADAMAS_IOURING_MODERN_FLAGS") {
+        Ok(v) => {
             let v = v.trim().to_ascii_lowercase();
-            v == "1" || v == "true" || v == "yes" || v == "on"
-        })
-        .unwrap_or(false)
+            !(v == "0" || v == "false" || v == "no" || v == "off")
+        }
+        Err(_) => true,
+    }
 }
 
 /// Build the io_uring ring, optionally applying the modern setup flags
@@ -1029,19 +1030,21 @@ mod modern_flags_tests {
     }
 
     #[test]
-    fn modern_flags_requested_parses_truthy_and_falsy() {
-        for v in ["1", "true", "TRUE", "Yes", "on", " on "] {
+    fn modern_flags_requested_default_on_unless_explicit_falsy() {
+        // Default-ON: truthy, unrecognized, or empty all enable.
+        for v in ["1", "true", "TRUE", "Yes", "on", " on ", "", "garbage"] {
             with_modern_flags(Some(v), || {
-                assert!(modern_flags_requested(), "{v:?} should be truthy");
+                assert!(modern_flags_requested(), "{v:?} should enable (default-on)");
             });
         }
-        for v in ["0", "false", "no", "off", "", "garbage"] {
+        // Only an explicit falsy value disables.
+        for v in ["0", "false", "no", "off", " OFF "] {
             with_modern_flags(Some(v), || {
-                assert!(!modern_flags_requested(), "{v:?} should be falsy");
+                assert!(!modern_flags_requested(), "{v:?} should disable");
             });
         }
         with_modern_flags(None, || {
-            assert!(!modern_flags_requested(), "unset should default off");
+            assert!(modern_flags_requested(), "unset should default ON");
         });
     }
 
