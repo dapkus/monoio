@@ -292,7 +292,43 @@ impl<D> Runtime<D> {
                         if !self.context.tasks.high_is_empty() {
                             let _ = self.driver.park_timeout(std::time::Duration::ZERO);
                         } else {
-                            let _ = self.driver.park();
+                            // AR.4: bounded low-load spin-before-park (flag-gated, default OFF).
+                            // At low load the shard is idle, so spinning the CQ briefly costs
+                            // IDLE CPU (not serving CPU) and cuts the park wakeup latency when
+                            // the next request arrives within the window — the inherent
+                            // per-request write latency that matters to upstream callers.
+                            // The -14% poll-spin falsification was measured at SATURATION,
+                            // where spinning steals serving CPU; this arm only runs when the
+                            // high queue is empty (nothing to serve), so that result does not
+                            // apply. Set ADAMAS_REACTOR_LOWLOAD_SPIN_US>0 (microseconds) to
+                            // enable; 0 (default) is byte-identical to the prior blocking park.
+                            static SPIN_US: std::sync::OnceLock<u64> = std::sync::OnceLock::new();
+                            let spin_us = *SPIN_US.get_or_init(|| {
+                                std::env::var("ADAMAS_REACTOR_LOWLOAD_SPIN_US")
+                                    .ok()
+                                    .and_then(|v| v.trim().parse::<u64>().ok())
+                                    .unwrap_or(0)
+                            });
+                            if spin_us == 0 {
+                                let _ = self.driver.park();
+                            } else {
+                                let deadline = std::time::Instant::now()
+                                    + std::time::Duration::from_micros(spin_us);
+                                loop {
+                                    let _ = self.driver.park_timeout(std::time::Duration::ZERO);
+                                    if !self.context.tasks.high_is_empty() {
+                                        // a completion woke serving work — skip the blocking
+                                        // park entirely (wakeup latency saved).
+                                        break;
+                                    }
+                                    if std::time::Instant::now() >= deadline {
+                                        // spin budget exhausted with no work — block to save
+                                        // idle power.
+                                        let _ = self.driver.park();
+                                        break;
+                                    }
+                                }
+                            }
                         }
                     }
 
