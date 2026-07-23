@@ -50,7 +50,10 @@ pub use driver::LegacyDriver;
 #[cfg(feature = "macros")]
 pub use monoio_macros::{main, test, test_all};
 pub use reactor_park::reactor_parked_nanos;
-pub use runtime::{register_stall_callback, unregister_stall_callback, StallCallback, StallEvent};
+pub use runtime::{
+    register_stall_callback, register_stall_site_probe, unregister_stall_callback,
+    unregister_stall_site_probe, StallCallback, StallEvent, StallSiteProbe,
+};
 pub use runtime::{spawn, spawn_with_priority, Runtime};
 pub use scheduler::TaskPriority;
 #[cfg(any(all(target_os = "linux", feature = "iouring"), feature = "legacy"))]

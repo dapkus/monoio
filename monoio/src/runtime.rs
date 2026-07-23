@@ -36,6 +36,19 @@ use crate::{
 pub struct StallEvent {
     /// Duration of the stalling poll in milliseconds.
     pub duration_ms: u64,
+    /// Opaque identity of the stall-site label *before* this poll ran, as
+    /// reported by the registered [`StallSiteProbe`] (0 when no probe is
+    /// registered).
+    ///
+    /// The stall callback reads the *post*-poll label itself; comparing it to
+    /// `pre_site` discriminates a **self**-attributed stall (the poll changed
+    /// the label ⇒ the stalling task set its own site) from an **inherited**
+    /// one (label unchanged across the poll ⇒ the attributed site was left by a
+    /// *parked* fiber and leaked onto this poll — the RAII stall-site guard
+    /// restores the prior label before the poll returns, so a guard wrapping a
+    /// purely synchronous span is invisible and the callback samples whatever a
+    /// parked fiber last set). This split measures the leak fraction directly.
+    pub pre_site: usize,
 }
 
 /// Type of the per-shard stall callback.
@@ -45,6 +58,14 @@ pub struct StallEvent {
 /// log). It must never block or yield.
 pub type StallCallback = fn(StallEvent);
 
+/// Type of the per-shard stall-site probe.
+///
+/// Returns an opaque, stable identity of the current stall-site label (adamas
+/// passes the label's `&'static str` data pointer). Called by `run_task!`
+/// *before* each measured poll to capture the pre-poll site; must be a cheap
+/// thread-local read and never block.
+pub type StallSiteProbe = fn() -> usize;
+
 thread_local! {
     /// Per-shard stall-detector hook. `None` = off (zero overhead).
     ///
@@ -52,6 +73,25 @@ thread_local! {
     /// Cleared on shard shutdown.
     static STALL_HOOK: std::cell::Cell<Option<(u64, StallCallback)>> =
         std::cell::Cell::new(None);
+
+    /// Per-shard stall-site probe (see [`StallSiteProbe`]). `None` = the event's
+    /// `pre_site` is reported as 0. Registered alongside the stall callback.
+    static STALL_SITE_PROBE: std::cell::Cell<Option<StallSiteProbe>> =
+        std::cell::Cell::new(None);
+}
+
+/// Register a stall-site probe for the current shard (see [`StallSiteProbe`]).
+///
+/// Optional companion to [`register_stall_callback`]: when set, `run_task!`
+/// captures the probe's value before each measured poll and delivers it as
+/// [`StallEvent::pre_site`]. Zero overhead when the stall hook is `None`.
+pub fn register_stall_site_probe(probe: StallSiteProbe) {
+    STALL_SITE_PROBE.with(|p| p.set(Some(probe)));
+}
+
+/// Remove the stall-site probe for the current shard.
+pub fn unregister_stall_site_probe() {
+    STALL_SITE_PROBE.with(|p| p.set(None));
 }
 
 /// Register a stall callback for the current shard.
@@ -86,11 +126,17 @@ macro_rules! run_task {
         match hook {
             None => $task.run(),
             Some((threshold_ms, cb)) => {
+                // Capture the pre-poll stall-site identity (0 when no probe is
+                // registered) so the callback can tell a self-set label from one
+                // inherited from a parked fiber. Cheap thread-local read; only on
+                // the armed path (hook Some), so zero overhead when the detector
+                // is off.
+                let pre_site = STALL_SITE_PROBE.with(|p| p.get()).map_or(0, |probe| probe());
                 let t0 = std::time::Instant::now();
                 $task.run();
                 let elapsed_ms = t0.elapsed().as_millis() as u64;
                 if elapsed_ms >= threshold_ms {
-                    cb(StallEvent { duration_ms: elapsed_ms });
+                    cb(StallEvent { duration_ms: elapsed_ms, pre_site });
                 }
             }
         }
